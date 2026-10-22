@@ -335,7 +335,7 @@ with tab_stats:
     st.header("Genres")
 
     films_df = fdf.drop_duplicates(subset=["film_title", "year"])
-    films_g = films_df[films_df["_genres"].str.len() > 0]
+    films_g = films_df[films_df["_genres"].apply(len) > 0]
 
     if films_g.empty:
         st.info("No genre information for the current selection.")
@@ -429,7 +429,7 @@ with tab_stats:
 
         # 3) Most common exact mixes
         st.subheader("Most common genre mixes")
-        combos = films_g[films_g["_genres"].str.len() >= 2]["_genres"].apply(
+        combos = films_g[films_g["_genres"].apply(len) >= 2]["_genres"].apply(
             lambda gs: " + ".join(sorted(set(gs)))
         )
         if combos.empty:
