@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
@@ -67,7 +68,19 @@ def sorted_unique(series: pd.Series) -> list:
 # ----------------------------------------------------------------------------
 st.sidebar.title("🎬 Filters")
 
-uploaded = st.sidebar.file_uploader("Upload a CSV (optional)", type="csv")
+
+
+def sidebar_uploader():
+    """Rendered at the very bottom of the sidebar. The widget's value is read
+    from session_state at the top of the script (before it is drawn)."""
+    st.sidebar.divider()
+    st.sidebar.file_uploader(
+        "Upload a CSV (optional)", type="csv", key="upload_csv",
+        help="Use your own file with the same columns instead of the bundled dataset.",
+    )
+
+
+uploaded = st.session_state.get("upload_csv")
 
 if uploaded is not None:
     df = load_data(uploaded)
@@ -79,12 +92,14 @@ else:
         f"No data found. Put `{DEFAULT_CSV.name}` next to `app.py`, "
         "or upload a CSV in the sidebar."
     )
+    sidebar_uploader()
     st.stop()
 
 required = {"film_title", "location_name", "latitude", "longitude"}
 missing = required - set(df.columns)
 if missing:
     st.error(f"The CSV is missing required columns: {', '.join(sorted(missing))}")
+    sidebar_uploader()
     st.stop()
 
 # ----------------------------------------------------------------------------
@@ -151,6 +166,8 @@ with st.sidebar.expander("More filters"):
         if "relation" in df.columns else []
     )
     only_with_coords = st.checkbox("Only rows with coordinates", value=False, key="f_coords")
+
+sidebar_uploader()
 
 # ----------------------------------------------------------------------------
 # Apply filters
@@ -312,12 +329,122 @@ with tab_stats:
             by_year.index = by_year.index.astype(int)
             st.bar_chart(by_year)
 
-        st.subheader("Top genres")
-        genre_counts = (
-            fdf["_genres"].explode().dropna().value_counts().head(15)
+
+    # ---------------- Genre analysis (counted per film, not per location row) ----
+    st.divider()
+    st.header("Genres")
+
+    films_df = fdf.drop_duplicates(subset=["film_title", "year"])
+    films_g = films_df[films_df["_genres"].str.len() > 0]
+
+    if films_g.empty:
+        st.info("No genre information for the current selection.")
+    else:
+        st.caption(
+            f"Based on {len(films_g):,} unique films with genre info "
+            f"(a film with 3 genres counts once in each)."
         )
-        if not genre_counts.empty:
-            st.bar_chart(genre_counts)
+
+        # 1) Genre distribution
+        g_counts = (
+            films_g["_genres"].explode().value_counts()
+            .rename_axis("genre").reset_index(name="films")
+        )
+        g_counts["share"] = g_counts["films"] / len(films_g)
+
+        st.subheader("Genre distribution")
+        dist = (
+            alt.Chart(g_counts)
+            .mark_bar()
+            .encode(
+                y=alt.Y("genre:N", sort="-x", title=None),
+                x=alt.X("films:Q", title="Films"),
+                tooltip=[
+                    alt.Tooltip("genre:N"),
+                    alt.Tooltip("films:Q", title="Films", format=","),
+                    alt.Tooltip("share:Q", title="% of films", format=".1%"),
+                ],
+            )
+            .properties(height=max(200, 24 * len(g_counts)))
+        )
+        st.altair_chart(dist, width="stretch")
+
+        # 2) Cross-genre matrix (co-occurrence)
+        st.subheader("Cross-genre mix")
+        mode = st.radio(
+            "Show",
+            ["Number of films", "% of row genre"],
+            horizontal=True,
+            key="f_cross_mode",
+            help="'% of row genre': of all films in the row genre, the share that "
+                 "also have the column genre (e.g. Romance films that are also Comedy).",
+        )
+
+        order = g_counts["genre"].tolist()
+        onehot = (
+            films_g["_genres"].explode().reset_index()
+            .assign(v=1)
+            .pivot_table(index="index", columns="_genres", values="v",
+                         aggfunc="max", fill_value=0)
+            .reindex(columns=order, fill_value=0)
+        )
+        co = onehot.T.dot(onehot)  # genre x genre co-occurrence counts
+        co.index.name = None
+        co.columns.name = None
+        totals = pd.Series(co.values.diagonal(), index=co.index)
+
+        long = co.stack().rename("films").reset_index()
+        long.columns = ["row_genre", "col_genre", "films"]
+        long = long[long["row_genre"] != long["col_genre"]]  # hide diagonal
+        long["pct"] = long["films"] / long["row_genre"].map(totals)
+
+        value_col = "films" if mode == "Number of films" else "pct"
+        fmt = ",.0f" if value_col == "films" else ".0%"
+
+        base = alt.Chart(long).encode(
+            x=alt.X("col_genre:N", sort=order, title=None,
+                    axis=alt.Axis(labelAngle=-45)),
+            y=alt.Y("row_genre:N", sort=order, title=None),
+        )
+        heat = base.mark_rect().encode(
+            color=alt.Color(f"{value_col}:Q", title=None, scale=alt.Scale(scheme="reds")),
+            tooltip=[
+                alt.Tooltip("row_genre:N", title="Genre"),
+                alt.Tooltip("col_genre:N", title="Also"),
+                alt.Tooltip("films:Q", title="Films", format=","),
+                alt.Tooltip("pct:Q", title=f"% of row genre", format=".1%"),
+            ],
+        )
+        labels = base.mark_text(fontSize=9).encode(
+            text=alt.Text(f"{value_col}:Q", format=fmt),
+            color=alt.condition(
+                alt.datum[value_col] > long[value_col].max() * 0.55,
+                alt.value("white"), alt.value("black"),
+            ),
+        )
+        st.altair_chart(
+            (heat + labels).properties(height=max(300, 28 * len(order))),
+            width="stretch",
+        )
+
+        # 3) Most common exact mixes
+        st.subheader("Most common genre mixes")
+        combos = films_g[films_g["_genres"].str.len() >= 2]["_genres"].apply(
+            lambda gs: " + ".join(sorted(set(gs)))
+        )
+        if combos.empty:
+            st.info("No multi-genre films in this selection.")
+        else:
+            top_n = st.slider("How many mixes", 5, 30, 15, key="f_combo_n")
+            top = combos.value_counts().head(top_n).rename_axis("mix").reset_index(name="films")
+            st.altair_chart(
+                alt.Chart(top).mark_bar().encode(
+                    y=alt.Y("mix:N", sort="-x", title=None),
+                    x=alt.X("films:Q", title="Films"),
+                    tooltip=["mix:N", alt.Tooltip("films:Q", format=",")],
+                ).properties(height=max(200, 24 * len(top))),
+                width="stretch",
+            )
 
     if "match_status" in fdf.columns:
         st.subheader("Match status")
